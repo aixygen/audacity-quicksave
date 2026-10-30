@@ -4,6 +4,8 @@
 
 ![Demo di Audacity Quick Save: modifichi un file, premi Ctrl+Alt+S, il file originale viene salvato](docs/demo.gif)
 
+**Funziona con Audacity 3.x su Linux** (testato con 3.4.2 e 3.7.8). Audacity 4 per ora non è supportato.
+
 [Read in English](README.md)
 
 ---
