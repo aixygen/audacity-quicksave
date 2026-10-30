@@ -116,4 +116,5 @@ Almost done. Enable Audacity's scripting module once:
 
 Then open an audio file, edit it and press the shortcut to save it in place.
 Backups of the previous versions go to ~/.local/state/audacity-quicksave/backups
+(a hidden folder, open it with: xdg-open ~/.local/state/audacity-quicksave/backups)
 EOF

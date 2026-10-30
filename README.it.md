@@ -74,7 +74,15 @@ Puoi lanciare `audacity-quicksave` anche da terminale.
 
 ### Backup
 
-A ogni salvataggio la versione precedente viene copiata in `~/.local/state/audacity-quicksave/backups`, con data e ora nel nome. Vengono tenute le 20 più recenti. Per cambiare queste impostazioni copia [`config.example.ini`](config.example.ini) in `~/.config/audacity-quicksave/config.ini`.
+A ogni salvataggio la versione precedente viene copiata in `~/.local/state/audacity-quicksave/backups`, con data e ora nel nome. Vengono tenute le 20 più recenti.
+
+`.local` è una cartella nascosta, quindi di base non la vedi nel gestore dei file. Per aprire direttamente la cartella dei backup
+
+```bash
+xdg-open ~/.local/state/audacity-quicksave/backups
+```
+
+Oppure premi **Ctrl+H** in File per mostrare le cartelle nascoste. Per cambiare cartella o numero di backup copia [`config.example.ini`](config.example.ini) in `~/.config/audacity-quicksave/config.ini`.
 
 ## Come funziona
 

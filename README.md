@@ -74,7 +74,15 @@ You can also run `audacity-quicksave` from a terminal.
 
 ### Backups
 
-Every save copies the previous version to `~/.local/state/audacity-quicksave/backups`, named with date and time. The 20 most recent are kept. To change this, copy [`config.example.ini`](config.example.ini) to `~/.config/audacity-quicksave/config.ini`.
+Every save copies the previous version to `~/.local/state/audacity-quicksave/backups`, named with date and time. The 20 most recent are kept.
+
+`.local` is a hidden folder, so you will not see it in your file manager by default. To open the backups folder directly:
+
+```bash
+xdg-open ~/.local/state/audacity-quicksave/backups
+```
+
+Or press **Ctrl+H** in Files to show hidden folders. To change the folder or the number of backups, copy [`config.example.ini`](config.example.ini) to `~/.config/audacity-quicksave/config.ini`.
 
 ## How it works
 
