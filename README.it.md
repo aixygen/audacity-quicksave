@@ -2,6 +2,8 @@
 
 **Un vero "Salva" per Audacity su Linux.** Premi una scorciatoia e l'audio che stai modificando viene riscritto sul file originale, nello stesso formato, con la stessa qualità, gli stessi tag e la stessa copertina. Una copia della versione precedente viene conservata in automatico.
 
+![Demo di Audacity Quick Save: modifichi un file, premi Ctrl+Alt+S, il file originale viene salvato](docs/demo.gif)
+
 [Read in English](README.md)
 
 ---

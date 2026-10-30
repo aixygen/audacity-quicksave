@@ -2,6 +2,8 @@
 
 **A real "Save" for Audacity on Linux.** Press one shortcut and the audio you are editing is written back over the original file, in the same format, with the same quality settings, tags and cover art. A backup of the previous version is kept automatically.
 
+![Audacity Quick Save demo: edit a file, press Ctrl+Alt+S, the original file is saved](docs/demo.gif)
+
 [Leggi in italiano](README.it.md)
 
 ---
