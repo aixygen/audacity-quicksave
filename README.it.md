@@ -82,7 +82,7 @@ A ogni salvataggio la versione precedente viene copiata in `~/.local/state/audac
 xdg-open ~/.local/state/audacity-quicksave/backups
 ```
 
-Oppure premi **Ctrl+H** in File per mostrare le cartelle nascoste. Per cambiare cartella o numero di backup copia [`config.example.ini`](config.example.ini) in `~/.config/audacity-quicksave/config.ini`.
+Oppure, nel gestore dei file, premi **Ctrl+L**, incolla `~/.local/state/audacity-quicksave/backups` e premi Invio. Per cambiare cartella o numero di backup copia [`config.example.ini`](config.example.ini) in `~/.config/audacity-quicksave/config.ini`.
 
 ## Come funziona
 

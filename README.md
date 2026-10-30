@@ -82,7 +82,7 @@ Every save copies the previous version to `~/.local/state/audacity-quicksave/bac
 xdg-open ~/.local/state/audacity-quicksave/backups
 ```
 
-Or press **Ctrl+H** in Files to show hidden folders. To change the folder or the number of backups, copy [`config.example.ini`](config.example.ini) to `~/.config/audacity-quicksave/config.ini`.
+Or, in your file manager, press **Ctrl+L**, paste `~/.local/state/audacity-quicksave/backups` and press Enter. To change the folder or the number of backups, copy [`config.example.ini`](config.example.ini) to `~/.config/audacity-quicksave/config.ini`.
 
 ## How it works
 
