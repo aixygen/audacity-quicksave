@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""
+audacity-quicksave
+==================
+
+A real "Save" for Audacity on Linux: writes the audio you are editing back
+over the original file, keeping its format, codec, bitrate, sample rate,
+channels, tags and cover art. A backup of the previous version is kept.
+
+How it works
+------------
+Audacity's mod-script-pipe module lets external programs send commands to
+Audacity through two named pipes. When the keyboard shortcut runs this script,
+it connects to Audacity and:
+
+  1. finds the file the active project was imported from (Audacity's own
+     "Recent Files" list, matched against the track names);
+  2. exports the whole project to a temporary lossless 32-bit float WAV;
+  3. re-encodes it with ffmpeg using the original file's characteristics;
+  4. backs up the original and atomically replaces it;
+  5. disconnects, so Audacity can still quit normally.
+
+Requirements: Audacity 3.x with mod-script-pipe enabled, Python 3.8+, ffmpeg.
+License: MIT.
+"""
+
+import configparser
+import errno
+import fcntl
+import json
+import locale
+import os
+import re
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+APP = "audacity-quicksave"
+VERSION = "1.0.0"
+
+UID = os.getuid()
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/{APP}-{UID}")
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / APP
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / APP / "config.ini"
+LOG_PATH = STATE_DIR / "quicksave.log"
+
+# Audacity preference holding the WAV export encoding (libsndfile subtype).
+WAV_ENCODING_PREF = "/FileFormats/ExportFormat_SF1_Type/WAV_10000"
+SF_FORMAT_FLOAT = "6"
+SF_FORMAT_PCM_16 = "2"  # Audacity's default when the preference is missing
+
+PROJECT_EXTENSIONS = {".aup3", ".aup", ".lof", ".txt"}
+
+DEFAULTS = {
+    "keep_backups": "20",
+    "backup_dir": str(STATE_DIR / "backups"),
+    "notifications": "yes",
+}
+
+# --------------------------------------------------------------------------
+# Messages (English and Italian)
+# --------------------------------------------------------------------------
+
+MESSAGES = {
+    "en": {
+        "saved": "Saved {name}",
+        "no_audacity": "Audacity is not running, or mod-script-pipe is not enabled.\n"
+                       "Enable it in Edit > Preferences > Modules and restart Audacity.",
+        "pipe_dead": "Audacity is not answering scripts.\n"
+                     "Try again. If it keeps happening, restart Audacity.",
+        "no_tracks": "The project has no audio tracks.",
+        "no_source": "Could not tell which file this project came from.\n"
+                     "Open the file again in Audacity (File > Open) and keep the "
+                     "track name equal to the file name.",
+        "source_missing": "The original file no longer exists:\n{path}",
+        "bad_path": "Unsupported characters in path:\n{path}",
+        "too_many_channels": "Files with more than 2 channels are not supported yet.",
+        "unsupported_codec": "Unsupported audio format: {codec}",
+        "export_failed": "Audacity could not export the audio:\n{detail}",
+        "encode_failed": "ffmpeg failed to encode the file:\n{detail}",
+        "probe_failed": "ffprobe could not read the original file:\n{detail}",
+        "no_ffmpeg": "ffmpeg and ffprobe are required. Install them with: sudo apt install ffmpeg",
+        "dir_not_writable": "Cannot write in the folder of the original file:\n{path}",
+        "error_title": "Audacity Quick Save: error",
+        "ok_title": "Audacity Quick Save",
+    },
+    "it": {
+        "saved": "Salvato {name}",
+        "no_audacity": "Audacity non è aperto, oppure mod-script-pipe non è attivo.\n"
+                       "Attivalo in Modifica > Preferenze > Moduli e riavvia Audacity.",
+        "pipe_dead": "Audacity non risponde agli script.\n"
+                     "Riprova. Se succede ancora, riavvia Audacity.",
+        "no_tracks": "Il progetto non contiene tracce audio.",
+        "no_source": "Non riesco a capire da quale file arriva questo progetto.\n"
+                     "Riapri il file in Audacity (File > Apri) e lascia il nome della "
+                     "traccia uguale al nome del file.",
+        "source_missing": "Il file originale non esiste più:\n{path}",
+        "bad_path": "Il percorso contiene caratteri non supportati:\n{path}",
+        "too_many_channels": "I file con più di 2 canali non sono ancora supportati.",
+        "unsupported_codec": "Formato audio non supportato: {codec}",
+        "export_failed": "Audacity non è riuscito a esportare l'audio:\n{detail}",
+        "encode_failed": "ffmpeg non è riuscito a creare il file:\n{detail}",
+        "probe_failed": "ffprobe non riesce a leggere il file originale:\n{detail}",
+        "no_ffmpeg": "Servono ffmpeg e ffprobe. Installali con: sudo apt install ffmpeg",
+        "dir_not_writable": "Non posso scrivere nella cartella del file originale:\n{path}",
+        "error_title": "Audacity Quick Save: errore",
+        "ok_title": "Audacity Quick Save",
+    },
+}
+
+
+def _lang():
+    for var in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
+        val = os.environ.get(var)
+        if val:
+            return "it" if val.lower().startswith("it") else "en"
+    try:
+        loc = locale.getlocale()[0] or ""
+    except ValueError:
+        loc = ""
+    return "it" if loc.lower().startswith("it") else "en"
+
+
+LANG = _lang()
+
+
+def msg(key, **kw):
+    return MESSAGES[LANG][key].format(**kw)
+
+
+class QuickSaveError(Exception):
+    """An error with a message meant for the user."""
+
+
+# --------------------------------------------------------------------------
+# Utilities
+# --------------------------------------------------------------------------
+
+def load_config():
+    cfg = configparser.ConfigParser()
+    cfg["main"] = DEFAULTS
+    if CONFIG_PATH.exists():
+        cfg.read(CONFIG_PATH)
+    return cfg["main"]
+
+
+def log(text):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOG_PATH, "a", encoding="utf-8") as fh:
+        fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {text}\n")
+
+
+def notify(title, body, error=False):
+    print(f"{title}: {body}", file=sys.stderr if error else sys.stdout)
+    if not shutil.which("notify-send"):
+        return
+    cmd = ["notify-send", "-a", "Audacity", "-i", "audacity",
+           "-u", "critical" if error else "normal"]
+    if not error:
+        cmd += ["-t", "3000"]
+    subprocess.run(cmd + [title, body], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --------------------------------------------------------------------------
+# Talking to Audacity through mod-script-pipe
+# --------------------------------------------------------------------------
+
+def _audacity_pids():
+    pids = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text().strip().lower()
+        except OSError:
+            continue
+        if "audacity" in comm and APP not in comm:
+            pids.append(entry.name)
+    return pids
+
+
+def find_pipes():
+    """Return (to_pipe, from_pipe) paths, or None.
+
+    Native installs create the pipes in /tmp. Flatpak and Snap give Audacity a
+    private /tmp, which is reachable through /proc/<pid>/root/tmp.
+    """
+    dirs = []
+    override = os.environ.get("AUDACITY_QUICKSAVE_PIPE_DIR")
+    if override:
+        dirs.append(Path(override))
+    pids = _audacity_pids()
+    if not pids and not override:
+        return None  # pipes left in /tmp by a closed Audacity are useless
+    dirs += [Path(f"/proc/{pid}/root/tmp") for pid in pids]
+    dirs.append(Path("/tmp"))
+    for d in dirs:
+        to_p = d / f"audacity_script_pipe.to.{UID}"
+        from_p = d / f"audacity_script_pipe.from.{UID}"
+        try:
+            if stat.S_ISFIFO(to_p.stat().st_mode) and stat.S_ISFIFO(from_p.stat().st_mode):
+                return to_p, from_p
+        except OSError:
+            continue
+    return None
+
+
+class AudacityPipe:
+    """A persistent connection to mod-script-pipe."""
+
+    def __init__(self):
+        self.to_fd = None
+        self.from_fd = None
+        self.buffer = b""
+
+    @property
+    def connected(self):
+        return self.to_fd is not None
+
+    def connect(self):
+        # Right after another client disconnects, Audacity takes a moment to
+        # recreate its pipes, so retry for up to two seconds.
+        error = "no_audacity"
+        for _ in range(20):
+            pipes = find_pipes()
+            if pipes:
+                to_p, from_p = pipes
+                try:
+                    # Non-blocking open fails with ENXIO if nobody reads the
+                    # pipe, instead of hanging forever on a stale one.
+                    fd = os.open(to_p, os.O_WRONLY | os.O_NONBLOCK)
+                    break
+                except OSError as exc:
+                    error = "pipe_dead" if exc.errno == errno.ENXIO else "no_audacity"
+            elif not _audacity_pids():
+                raise QuickSaveError(msg("no_audacity"))
+            time.sleep(0.1)
+        else:
+            raise QuickSaveError(msg(error))
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+        self.to_fd = fd
+
+        # Audacity opens its end of the reply pipe right after we connect.
+        def on_timeout(*_):
+            raise TimeoutError()
+
+        signal.signal(signal.SIGALRM, on_timeout)
+        signal.alarm(10)
+        try:
+            self.from_fd = os.open(from_p, os.O_RDONLY)
+        except TimeoutError as exc:
+            self.close()
+            raise QuickSaveError(msg("pipe_dead")) from exc
+        finally:
+            signal.alarm(0)
+        log(f"connected to Audacity via {to_p.parent}")
+
+    def close(self):
+        for fd in (self.to_fd, self.from_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.to_fd = self.from_fd = None
+        self.buffer = b""
+
+    def command(self, cmd, timeout=600):
+        """Send one command. Returns (ok, text)."""
+        if not self.connected:
+            self.connect()
+        try:
+            os.write(self.to_fd, (cmd + "\n").encode("utf-8"))
+        except BrokenPipeError as exc:
+            self.close()
+            raise QuickSaveError(msg("pipe_dead")) from exc
+
+        deadline = time.monotonic() + timeout
+        while True:
+            # A reply ends with "BatchCommand finished: ...\n" and an empty line.
+            match = re.search(rb"BatchCommand finished: ([^\n]*)\n\n", self.buffer)
+            if match:
+                text = self.buffer[:match.start()].decode("utf-8", "replace")
+                status = match.group(1).decode("utf-8", "replace")
+                self.buffer = self.buffer[match.end():]
+                return status.strip().startswith("OK"), text.strip("\n")
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise QuickSaveError(msg("pipe_dead"))
+            ready, _, _ = select.select([self.from_fd], [], [], left)
+            if not ready:
+                continue
+            chunk = os.read(self.from_fd, 65536)
+            if not chunk:
+                self.close()
+                raise QuickSaveError(msg("pipe_dead"))
+            self.buffer += chunk
+
+
+def quote_param(value):
+    if '"' in value or "\n" in value:
+        raise QuickSaveError(msg("bad_path", path=value))
+    return f'"{value}"'
+
+
+# --------------------------------------------------------------------------
+# Finding the original file
+# --------------------------------------------------------------------------
+
+def recent_files(pipe):
+    """Audacity's recent files, most recent first."""
+    files = []
+    for i in range(1, 100):
+        ok, text = pipe.command(f'GetPreference: Name="/RecentFiles/file{i:02d}"')
+        if not ok:
+            break
+        files.append(text.strip())
+    files.reverse()  # Audacity stores them oldest first
+    return files
+
+
+def wave_tracks(pipe):
+    ok, text = pipe.command("GetInfo: Type=Tracks Format=JSON")
+    if not ok:
+        return []
+    try:
+        tracks = json.loads(text)
+    except ValueError:
+        return []
+    return [t for t in tracks if t.get("kind") == "wave"]
+
+
+def find_source(pipe):
+    tracks = wave_tracks(pipe)
+    if not tracks:
+        raise QuickSaveError(msg("no_tracks"))
+    names = {t.get("name", "") for t in tracks}
+    for path in recent_files(pipe):
+        p = Path(path)
+        if p.suffix.lower() in PROJECT_EXTENSIONS:
+            continue
+        if p.stem in names:
+            if not p.exists():
+                raise QuickSaveError(msg("source_missing", path=path))
+            return p
+    raise QuickSaveError(msg("no_source"))
+
+
+# --------------------------------------------------------------------------
+# Reading the original file's characteristics
+# --------------------------------------------------------------------------
+
+def run(cmd):
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def probe(path):
+    code, out, err = run(["ffprobe", "-v", "error", "-print_format", "json",
+                          "-show_format", "-show_streams", str(path)])
+    if code != 0:
+        raise QuickSaveError(msg("probe_failed", detail=err.strip()[-400:]))
+    info = json.loads(out)
+    audio = [s for s in info.get("streams", []) if s.get("codec_type") == "audio"]
+    if not audio:
+        raise QuickSaveError(msg("probe_failed", detail="no audio stream"))
+    covers = [s for s in info.get("streams", [])
+              if s.get("codec_type") == "video"
+              and s.get("disposition", {}).get("attached_pic") == 1]
+    return info.get("format", {}), audio[0], covers
+
+
+def _int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def bitrate_of(fmt, stream):
+    return _int(stream.get("bit_rate")) or _int(fmt.get("bit_rate"))
+
+
+def bit_depth_of(stream):
+    depth = _int(stream.get("bits_per_raw_sample")) or _int(stream.get("bits_per_sample"))
+    if not depth:
+        depth = 16 if stream.get("sample_fmt", "").startswith("s16") else 24
+    return depth
+
+
+def mp3_details(path):
+    """Return (is_vbr, vbr_scale or None, id3v2_version or None, has_id3v1)."""
+    with open(path, "rb") as fh:
+        head = fh.read(1 << 16)
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        id3v1 = False
+        if size >= 128:
+            fh.seek(size - 128)
+            id3v1 = fh.read(3) == b"TAG"
+    id3v2 = None
+    start = 0
+    if head[:3] == b"ID3" and len(head) >= 10:
+        id3v2 = head[3]
+        tag_size = (head[6] << 21) | (head[7] << 14) | (head[8] << 7) | head[9]
+        start = 10 + tag_size
+        if start + 4096 > len(head):
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                head = fh.read(8192)
+            start = 0
+    frame = head[start:start + 4096]
+    vbr = b"Xing" in frame or b"VBRI" in frame
+    # The Xing/Info header written by LAME may store the VBR quality.
+    vbr_scale = None
+    pos = max(frame.find(b"Xing"), frame.find(b"Info"))
+    if pos >= 0 and pos + 8 <= len(frame):
+        flags = int.from_bytes(frame[pos + 4:pos + 8], "big")
+        cur = pos + 8 + (4 if flags & 1 else 0) + (4 if flags & 2 else 0) \
+            + (100 if flags & 4 else 0)
+        if flags & 8 and cur + 4 <= len(frame):
+            vbr_scale = int.from_bytes(frame[cur:cur + 4], "big")
+    return vbr, vbr_scale, id3v2, id3v1
+
+
+STANDARD_KBPS = (32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 192,
+                 224, 256, 288, 320, 384, 448, 512)
+
+
+def snap_bitrate(bps):
+    """Measured bitrates drift from the nominal one (243 kbps for 256)."""
+    kbps = bps / 1000
+    return min(STANDARD_KBPS, key=lambda k: abs(k - kbps)) * 1000
+
+
+def lame_vbr_quality(avg_bitrate, vbr_scale=None):
+    if vbr_scale and 0 < vbr_scale <= 100:  # 0 means "not set"
+        return max(0, min(9, (100 - vbr_scale) // 10))
+    kbps = avg_bitrate / 1000
+    for limit, q in ((245, 0), (225, 1), (190, 2), (175, 3), (165, 4),
+                     (130, 5), (115, 6), (100, 7), (85, 8)):
+        if kbps >= limit:
+            return q
+    return 9
+
+
+def has_encoder(name):
+    code, out, _ = run(["ffmpeg", "-hide_banner", "-encoders"])
+    return code == 0 and re.search(rf"\s{re.escape(name)}\s", out) is not None
+
+
+def encoder_args(path, fmt, stream):
+    """ffmpeg audio encoder arguments that reproduce the original stream."""
+    codec = stream.get("codec_name", "")
+    rate = stream.get("sample_rate")
+    channels = _int(stream.get("channels"), 2)
+    bitrate = bitrate_of(fmt, stream)
+    args = []
+    extra = []
+    description = codec.upper()
+
+    if codec in ("aac", "vorbis", "opus") and bitrate:
+        bitrate = snap_bitrate(bitrate)
+
+    if codec == "mp3":
+        vbr, vbr_scale, id3v2, id3v1 = mp3_details(path)
+        args = ["-c:a", "libmp3lame"]
+        if vbr:
+            q = lame_vbr_quality(bitrate, vbr_scale)
+            args += ["-q:a", str(q)]
+            description = f"MP3 VBR V{q}"
+        else:
+            kbps = max(8, round(bitrate / 1000)) if bitrate else 192
+            args += ["-b:a", f"{kbps}k"]
+            description = f"MP3 {kbps} kbps"
+        extra += ["-id3v2_version", str(id3v2 if id3v2 in (3, 4) else 4)]
+        extra += ["-write_id3v1", "1" if id3v1 else "0"]
+    elif codec == "aac":
+        profile = (stream.get("profile") or "").upper()
+        if "HE" in profile and has_encoder("libfdk_aac"):
+            args = ["-c:a", "libfdk_aac",
+                    "-profile:a", "aac_he_v2" if "V2" in profile else "aac_he"]
+        else:
+            args = ["-c:a", "aac"]
+        if bitrate:
+            args += ["-b:a", str(bitrate)]
+        description = f"AAC {round(bitrate / 1000)} kbps" if bitrate else "AAC"
+    elif codec == "vorbis":
+        args = ["-c:a", "libvorbis"]
+        if bitrate:
+            args += ["-b:a", str(bitrate)]
+        description = "Ogg Vorbis"
+    elif codec == "opus":
+        args = ["-c:a", "libopus"]
+        if bitrate:
+            args += ["-b:a", str(bitrate)]
+        description = "Opus"
+        rate = None  # Opus always runs at 48 kHz internally
+    elif codec == "flac":
+        depth = bit_depth_of(stream)
+        args = ["-c:a", "flac", "-sample_fmt", "s16" if depth <= 16 else "s32"]
+        if depth > 16:
+            args += ["-bits_per_raw_sample", str(depth)]
+        description = f"FLAC {depth} bit"
+    elif codec == "alac":
+        depth = bit_depth_of(stream)
+        args = ["-c:a", "alac", "-sample_fmt", "s16p" if depth <= 16 else "s32p"]
+        description = f"ALAC {depth} bit"
+    elif codec == "wavpack":
+        args = ["-c:a", "wavpack"]
+        description = "WavPack"
+    elif codec.startswith("pcm_"):
+        args = ["-c:a", codec]
+        description = f"PCM {codec[4:]}"
+    elif codec in ("mp2", "ac3", "eac3", "wmav2", "wmav1"):
+        args = ["-c:a", codec]
+        if bitrate:
+            args += ["-b:a", str(bitrate)]
+    else:
+        raise QuickSaveError(msg("unsupported_codec", codec=codec or "?"))
+
+    if rate:
+        args += ["-ar", str(rate)]
+    args += ["-ac", str(channels)]
+    if stream.get("channel_layout"):
+        args += ["-channel_layout", stream["channel_layout"]]
+    return args, extra, description
+
+
+# --------------------------------------------------------------------------
+# The save itself
+# --------------------------------------------------------------------------
+
+def prune_backups(backup_dir, keep):
+    if keep <= 0:
+        return
+    files = sorted((p for p in backup_dir.iterdir() if p.is_file()),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in files[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def export_wav(pipe, target, channels, rate):
+    """Export the whole project to a 32-bit float WAV at the original rate."""
+    if rate:
+        # Audacity mixes the export at the project rate. A project opened in a
+        # window that already existed can keep another rate (44.1 kHz for a
+        # 96 kHz file), which would resample the audio twice.
+        pipe.command(f"SetProject: Rate={rate}")
+    ok, previous = pipe.command(f'GetPreference: Name="{WAV_ENCODING_PREF}"')
+    previous = previous.strip() if ok and previous.strip() else SF_FORMAT_PCM_16
+    pipe.command(f'SetPreference: Name="{WAV_ENCODING_PREF}" Value="{SF_FORMAT_FLOAT}"')
+    try:
+        pipe.command("SelectAll:")
+        ok, text = pipe.command(
+            f"Export2: Filename={quote_param(str(target))} NumChannels={channels}")
+    finally:
+        pipe.command(f'SetPreference: Name="{WAV_ENCODING_PREF}" Value="{previous}"')
+    if not ok or not target.exists():
+        raise QuickSaveError(msg("export_failed", detail=text.strip()[-400:]))
+
+
+def save(pipe, cfg):
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        raise QuickSaveError(msg("no_ffmpeg"))
+
+    source = find_source(pipe)
+    folder = source.parent
+    if not os.access(folder, os.W_OK):
+        raise QuickSaveError(msg("dir_not_writable", path=folder))
+
+    fmt, stream, covers = probe(source)
+    channels = _int(stream.get("channels"), 2)
+    if channels > 2:
+        raise QuickSaveError(msg("too_many_channels"))
+    enc_args, mux_args, description = encoder_args(source, fmt, stream)
+
+    tag = f"{APP}-{os.getpid()}-{int(time.time())}"
+    temp_wav = folder / f".{source.stem}.{tag}.export.wav"
+    temp_out = folder / f".{source.stem}.{tag}.out{source.suffix}"
+    try:
+        # The temporary WAV goes next to the original: Flatpak and Snap builds
+        # of Audacity cannot write to the host /tmp.
+        export_wav(pipe, temp_wav, channels, _int(stream.get("sample_rate")))
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-i", str(temp_wav), "-i", str(source),
+               "-map", "0:a:0"]
+        for i in range(len(covers)):
+            cmd += ["-map", f"1:v:{i}"]
+        cmd += enc_args
+        if covers:
+            cmd += ["-c:v", "copy", "-disposition:v", "attached_pic"]
+        cmd += ["-map_metadata", "1", "-map_metadata:s:a:0", "1:s:a:0",
+                "-map_chapters", "1"]
+        cmd += mux_args
+        cmd.append(str(temp_out))
+        code, _, err = run(cmd)
+        if code != 0 or not temp_out.exists():
+            raise QuickSaveError(msg("encode_failed", detail=err.strip()[-400:]))
+
+        backup_dir = Path(os.path.expanduser(cfg.get("backup_dir")))
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup = backup_dir / f"{datetime.now():%Y%m%d-%H%M%S}_{source.name}"
+        shutil.copy2(source, backup)
+        shutil.copymode(source, temp_out)
+        os.replace(temp_out, source)
+        prune_backups(backup_dir, _int(cfg.get("keep_backups"), 20))
+        log(f"saved {source} ({description}), backup {backup}")
+        rate = _int(stream.get("sample_rate"))
+        details = description
+        if rate:
+            details += f", {rate / 1000:g} kHz"
+        details += ", stereo" if channels == 2 else ", mono"
+        return {"ok": True, "file": str(source), "details": details}
+    finally:
+        for tmp in (temp_wav, temp_out):
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+USAGE = f"""\
+{APP} {VERSION}
+Save the audio open in Audacity back over the original file.
+
+usage: {APP}            save the active Audacity project over its original file
+       {APP} --version
+"""
+
+
+def run_save(cfg):
+    """Connect, save, and always disconnect.
+
+    The connection must not stay open: while a script holds the pipe,
+    Audacity cannot quit cleanly. When the client disconnects, Audacity
+    recreates the pipes and waits for the next one.
+    """
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(RUNTIME_DIR / f"{APP}.lock", "w") as lock:
+        try:
+            # Two quick presses must not talk to Audacity at the same time.
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return None
+        pipe = AudacityPipe()
+        try:
+            return save(pipe, cfg)
+        finally:
+            pipe.close()
+
+
+def main(argv):
+    arg = argv[1] if len(argv) > 1 else ""
+    if arg in ("-h", "--help"):
+        print(USAGE)
+        return 0
+    if arg == "--version":
+        print(f"{APP} {VERSION}")
+        return 0
+    if arg in ("--stop", "--status"):
+        # Kept for compatibility with 1.0 development builds, nothing to do.
+        return 0
+    if arg:
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    cfg = load_config()
+    use_notify = cfg.getboolean("notifications", fallback=True)
+    try:
+        result = run_save(cfg)
+    except QuickSaveError as exc:
+        log(f"error: {exc}")
+        if use_notify:
+            notify(msg("error_title"), str(exc), error=True)
+        else:
+            print(exc, file=sys.stderr)
+        return 1
+    except Exception as exc:
+        log(f"unexpected error: {exc!r}")
+        notify(msg("error_title"), repr(exc), error=True)
+        return 1
+    if result is None:
+        return 0  # another save is already running
+    # GNOME joins lines in notifications, so keep it on one line.
+    body = f"{msg('saved', name=Path(result['file']).name)}, {result['details']}"
+    if use_notify:
+        notify(msg("ok_title"), body)
+    else:
+        print(body)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
